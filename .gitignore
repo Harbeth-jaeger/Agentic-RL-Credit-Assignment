@@ -1,0 +1,114 @@
+# -----------------------------------------------------------------------------
+# External storage links
+# -----------------------------------------------------------------------------
+# These names point to persistent datasets, models, and experiment outputs
+# outside the repository. Never commit the links or their targets.
+/data
+/models
+/outputs
+
+# External source trees belong in third_party and should normally be Git
+# submodules. Tracked submodule entries are unaffected by this ignore rule;
+# accidental ordinary clones and copied source trees remain untracked.
+/third_party/*
+
+# -----------------------------------------------------------------------------
+# Secrets and local configuration
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+credentials.json
+secrets.json
+
+# -----------------------------------------------------------------------------
+# Python
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.pytype/
+.ipynb_checkpoints/
+
+# Local environments must not live in this repository.
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# Packaging and build products
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# -----------------------------------------------------------------------------
+# ML/RL runtime artifacts
+# -----------------------------------------------------------------------------
+checkpoints/
+checkpoint*/
+wandb/
+ray_results/
+lightning_logs/
+mlruns/
+tensorboard/
+events.out.tfevents.*
+
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.onnx
+*.bin
+
+# Hydra and common experiment output directories
+multirun/
+/outputs-*/
+
+# Generated logs, process state, and temporary files
+*.log
+*.pid
+*.pid.lock
+*.tmp
+*.temp
+tmp/
+temp/
+.cache/
+cache/
+
+# Download fragments and archives
+*.part
+*.aria2
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+
+# -----------------------------------------------------------------------------
+# Editors and operating systems
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
