@@ -1,0 +1,11 @@
+alfworld_data_root: /cephfs/wenhaozhang/datasets/agentic-credit-assignment/alfworld/downloads
+alfworld_max_steps: 50
+alfworld_history_length: 2
+alfworld_tokens_per_turn: 192
+aca_method: grpo
+aca_audit_dir: /tmp/aca-001-audit
+aca_audit_top_k: 20
+aca_min_success_support: 2
+aca_min_success_coverage: 0.5
+aca_top_k: 3
+aca_credit_strength: 0.5

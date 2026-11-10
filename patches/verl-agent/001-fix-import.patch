@@ -1,0 +1,327 @@
+diff --git a/agent_system/environments/env_package/alfworld/projection.py b/agent_system/environments/env_package/alfworld/projection.py
+index fbf2f79..31d59be 100644
+--- a/agent_system/environments/env_package/alfworld/projection.py
++++ b/agent_system/environments/env_package/alfworld/projection.py
+@@ -44,7 +44,12 @@ def alfworld_projection(actions: List[str], action_pools: List[List[str]]):
+             extracted_action = actions[i][start_idx + len(start_tag):end_idx].strip().lower()
+             
+             actions[i] = extracted_action
+-            valids[i] = 1
++            # A syntactically valid response can still name an action that the
++            # current ALFWorld state does not admit.  Keep passing the extracted
++            # action to the environment (so the no-op remains part of the
++            # trajectory), but report it as invalid for auditing.
++            admissible = {item.strip().lower() for item in action_pools[i]}
++            valids[i] = int(extracted_action in admissible)
+ 
+         except:
+             actions[i] = actions[i][-30:]
+diff --git a/recipe/GraphGPO/config/graphgpo_trainer.yaml b/recipe/GraphGPO/config/graphgpo_trainer.yaml
+index 8ad49ff..5591bef 100644
+--- a/recipe/GraphGPO/config/graphgpo_trainer.yaml
++++ b/recipe/GraphGPO/config/graphgpo_trainer.yaml
+@@ -31,6 +31,20 @@ algorithm:
+     enable: False
+     metric: null
+     max_num_gen_batches: 0
++  bottleneckflow:
++    min_success_support: 2
++    min_success_coverage: 0.5
++    lcb_quantile: 0.05
++    top_k: 3
++    credit_strength: 0.5
++    flow_temperature: 0.5
++
++aca:
++  enabled: false
++  train_metrics_file: null
++  eval_metrics_file: null
++  rollout_file: null
++  graph_file: null
+ 
+ env:
+   webshop:
+diff --git a/recipe/GraphGPO/core_graph.py b/recipe/GraphGPO/core_graph.py
+index 71eafd7..3607c2f 100644
+--- a/recipe/GraphGPO/core_graph.py
++++ b/recipe/GraphGPO/core_graph.py
+@@ -162,7 +162,7 @@ class ComplexGraph:
+                 g.add_edge(
+                     anchor_h,
+                     next_h,
+-                    action=data.non_tensor_batch['text_actions'][i],
++                    action=data.non_tensor_batch.get('executed_actions', data.non_tensor_batch['text_actions'])[i],
+                     traj_uid=data.non_tensor_batch['traj_uid'][i],
+                     uid=data.non_tensor_batch['uid'][i],
+                     data_id=i,
+@@ -900,4 +900,4 @@ def compute_graphgpo_outcome_advantage(
+         # Skip episode_norm_reward entirely when its weight is 0 to save compute.
+         scores = step_advantage_w * step_advantages
+ 
+-    return scores, scores
+\ No newline at end of file
++    return scores, scores
+diff --git a/recipe/GraphGPO/graphgpo_env_manager.py b/recipe/GraphGPO/graphgpo_env_manager.py
+index 59d7b70..32e0d10 100644
+--- a/recipe/GraphGPO/graphgpo_env_manager.py
++++ b/recipe/GraphGPO/graphgpo_env_manager.py
+@@ -193,6 +193,10 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
+         # add action_valid to infos
+         for i, info in enumerate(infos):
+             info['is_action_valid'] = to_numpy(valids[i])
++            info['executed_action'] = actions[i]
++            info['raw_observation'] = text_obs[i]
++            info['environment_done'] = bool(dones[i])
++            info['task_description'] = self.tasks[i]
+ 
+         # next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_location_holding_commands}
+         next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs_location_holding_commands}
+@@ -794,4 +798,4 @@ def make_envs(config):
+         return envs, val_envs
+     else:
+         print("Environment not supported")
+-        exit(1)
+\ No newline at end of file
++        exit(1)
+diff --git a/recipe/GraphGPO/graphgpo_ray_trainer.py b/recipe/GraphGPO/graphgpo_ray_trainer.py
+index f903a21..6c9501e 100644
+--- a/recipe/GraphGPO/graphgpo_ray_trainer.py
++++ b/recipe/GraphGPO/graphgpo_ray_trainer.py
+@@ -98,6 +98,7 @@ class AdvantageEstimator(str, Enum):
+     GRPO_PASSK = "grpo_passk"
+     GiGPO = 'gigpo'
+     GraphGPO = 'graphgpo'
++    BottleneckFlow = 'bottleneckflow'
+     HGPO = 'hgpo'
+ 
+ 
+@@ -472,6 +473,7 @@ class RayPPOTrainer:
+             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
+             AdvantageEstimator.GiGPO,
+             AdvantageEstimator.GraphGPO,
++            AdvantageEstimator.BottleneckFlow,
+         ]:
+             self.use_critic = False
+         else:
+@@ -486,7 +488,11 @@ class RayPPOTrainer:
+         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+ 
+         # 1. Check total batch size for data correctness
+-        real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
++        # In agent training, trajectories are repeated by env.rollout.n inside
++        # TrajectoryCollector (actor_rollout_ref.rollout.n intentionally stays
++        # at 1). Validate the batch that actually reaches the distributed
++        # workers rather than the pre-environment placeholder batch.
++        real_train_batch_size = config.data.train_batch_size * config.env.rollout.n
+         assert real_train_batch_size % n_gpus == 0, f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
+ 
+         # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
+@@ -785,6 +791,14 @@ class RayPPOTrainer:
+             # evaluate using reward_function
+             result = self.val_reward_fn(test_batch, return_dict=True)
+             reward_tensor = result["reward_tensor"]
++            if self.config.aca.get("rollout_file"):
++                from agentic_credit_assignment.verl.bottleneckflow import append_eval_rollouts
++
++                append_eval_rollouts(
++                    batch=test_output_gen_batch,
++                    global_step=self.global_steps,
++                    rollout_path=self.config.aca.rollout_file,
++                )
+             scores = reward_tensor.sum(-1).cpu().tolist()
+             sample_scores.extend(scores)
+ 
+@@ -959,6 +973,12 @@ class RayPPOTrainer:
+         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
+         with open(local_latest_checkpointed_iteration, "w") as f:
+             f.write(str(self.global_steps))
++        # Human-facing stable name requested by ACA.  The real directory keeps
++        # veRL's global_step_N convention so automatic resume remains upstream-
++        # compatible.
++        step_alias = os.path.join(self.config.trainer.default_local_dir, f"step_{self.global_steps}")
++        if not os.path.lexists(step_alias):
++            os.symlink(os.path.basename(local_global_step_folder), step_alias)
+ 
+     def _load_checkpoint(self):
+         if self.config.trainer.resume_mode == "disable":
+@@ -1069,6 +1089,7 @@ class RayPPOTrainer:
+             for batch_dict in self.train_dataloader:
+                 metrics = {}
+                 timing_raw = {}
++                val_metrics = None
+                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+ 
+                 # pop those keys for generation
+@@ -1137,21 +1158,25 @@ class RayPPOTrainer:
+                             gamma=self.config.algorithm.gamma,
+                         )
+                         batch.batch['step_rewards'] = step_rewards_tensor
+-                    elif self.config.algorithm.adv_estimator == AdvantageEstimator.GraphGPO:
++                    elif self.config.algorithm.adv_estimator in (
++                        AdvantageEstimator.GraphGPO,
++                        AdvantageEstimator.BottleneckFlow,
++                    ):
+                         graphgpo_cfg = self.config.algorithm.get("graphgpo", {})
+                         Gs = core_graph.ComplexGraph.from_data(
+                             gen_batch_output,
+                             enable_similarity=graphgpo_cfg.get("enable_similarity", False),
+                             similarity_thresh=graphgpo_cfg.get("similarity_thresh", 0.95),
+                         )
+-                        core_graph.ComplexGraph.Calculate_all_shortest_path(Gs)
+-                        step_rewards_tensor = core_graph.compute_graph_path_returns(
+-                            batch=batch,
+-                            Gs=Gs,
+-                            gamma=self.config.algorithm.gamma,
+-                            normalize_distance=graphgpo_cfg.get("normalize_distance", False),
+-                        )
+-                        batch.batch['step_rewards'] = step_rewards_tensor
++                        if self.config.algorithm.adv_estimator == AdvantageEstimator.GraphGPO:
++                            core_graph.ComplexGraph.Calculate_all_shortest_path(Gs)
++                            step_rewards_tensor = core_graph.compute_graph_path_returns(
++                                batch=batch,
++                                Gs=Gs,
++                                gamma=self.config.algorithm.gamma,
++                                normalize_distance=graphgpo_cfg.get("normalize_distance", False),
++                            )
++                            batch.batch['step_rewards'] = step_rewards_tensor
+ 
+                     batch.batch["response_mask"] = compute_response_mask(batch)
+ 
+@@ -1204,22 +1229,47 @@ class RayPPOTrainer:
+ 
+                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+ 
+-                        batch = compute_advantage(
+-                            batch,
+-                            adv_estimator=self.config.algorithm.adv_estimator,
+-                            gamma=self.config.algorithm.gamma,
+-                            lam=self.config.algorithm.lam,
+-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+-                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+-                            use_pf_ppo=self.config.algorithm.use_pf_ppo,
+-                            pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
+-                            pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
+-                            step_advantage_w=self.config.algorithm.get("graphgpo", {}).get("step_advantage_w", 1.0),
+-                            episode_advantage_w=self.config.algorithm.get("graphgpo", {}).get("episode_advantage_w", 1.0),
+-                            gigpo_mode=self.config.algorithm.get("graphgpo", {}).get("mode", "mean_std_norm"),
+-                            epsilon=1e-6,
+-                        )
++                        if self.config.algorithm.adv_estimator == AdvantageEstimator.BottleneckFlow:
++                            # Preserve GraphGPO's step-weighted episode baseline;
++                            # only redistribute it across steps with our B+C rule.
++                            episode_advantages = core_gigpo.episode_norm_reward(
++                                token_level_rewards=batch.batch["token_level_rewards"],
++                                response_mask=batch.batch["response_mask"],
++                                index=batch.non_tensor_batch["uid"],
++                                traj_index=batch.non_tensor_batch["traj_uid"],
++                                remove_std=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
++                                compute_mean_std_cross_steps=True,
++                            )
++                            from agentic_credit_assignment.verl.bottleneckflow import apply_bottleneckflow
++
++                            batch, credit_metrics = apply_bottleneckflow(
++                                batch=batch,
++                                episode_advantages=episode_advantages,
++                                response_mask=batch.batch["response_mask"],
++                                graphs=Gs,
++                                config=self.config.algorithm.get("bottleneckflow", {}),
++                                global_step=self.global_steps,
++                                rollout_path=self.config.aca.get("rollout_file"),
++                                graph_path=self.config.aca.get("graph_file"),
++                            )
++                            metrics.update(credit_metrics)
++                        else:
++                            batch = compute_advantage(
++                                batch,
++                                adv_estimator=self.config.algorithm.adv_estimator,
++                                gamma=self.config.algorithm.gamma,
++                                lam=self.config.algorithm.lam,
++                                num_repeat=self.config.actor_rollout_ref.rollout.n,
++                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
++                                multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
++                                use_pf_ppo=self.config.algorithm.use_pf_ppo,
++                                pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
++                                pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
++                                step_advantage_w=self.config.algorithm.get("graphgpo", {}).get("step_advantage_w", 1.0),
++                                episode_advantage_w=self.config.algorithm.get("graphgpo", {}).get("episode_advantage_w", 1.0),
++                                gigpo_mode=self.config.algorithm.get("graphgpo", {}).get("mode", "mean_std_norm"),
++                                epsilon=1e-6,
++                            )
+ 
+                     batch = adjust_batch(self.config, batch, mode='copy')
+ 
+@@ -1335,6 +1385,23 @@ class RayPPOTrainer:
+ 
+                 # TODO: make a canonical logger that supports various backend
+                 logger.log(data=metrics, step=self.global_steps)
++                if self.config.aca.get("train_metrics_file"):
++                    from agentic_credit_assignment.verl.bottleneckflow import append_jsonl
++                    append_jsonl(
++                        self.config.aca.train_metrics_file,
++                        {"global_step": self.global_steps, **metrics},
++                    )
++                if val_metrics and self.config.aca.get("eval_metrics_file"):
++                    eval_path = self.config.aca.eval_metrics_file
++                    os.makedirs(os.path.dirname(eval_path), exist_ok=True)
++                    with open(eval_path, "w", encoding="utf-8") as handle:
++                        json.dump(
++                            {"global_step": self.global_steps, **val_metrics},
++                            handle,
++                            ensure_ascii=False,
++                            indent=2,
++                            default=lambda value: value.item() if hasattr(value, "item") else str(value),
++                        )
+ 
+                 progress_bar.update(1)
+                 self.global_steps += 1
+diff --git a/recipe/GraphGPO/rollout_loop.py b/recipe/GraphGPO/rollout_loop.py
+index 399be42..8982881 100644
+--- a/recipe/GraphGPO/rollout_loop.py
++++ b/recipe/GraphGPO/rollout_loop.py
+@@ -188,6 +188,10 @@ class TrajectoryCollector:
+             'index': item,
+             'data_source': data_source
+         })
++        # Keep the exact string sent to the tokenizer/model.  It is deliberately
++        # stored outside the tensor batch so pilot and full-run traces can be
++        # inspected without attempting to reconstruct prompts after the fact.
++        row_dict['formatted_prompt'] = prompt_with_chat_template
+ 
+         if self.config.data.get('return_raw_chat', False):
+             row_dict['raw_prompt'] = chat.tolist()
+@@ -391,6 +395,27 @@ class TrajectoryCollector:
+                 batch.non_tensor_batch['is_action_valid'] = np.array([info['is_action_valid'] for info in infos], dtype=bool)
+             else:
+                 batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
++            batch.non_tensor_batch['executed_actions'] = np.array(
++                [info.get('executed_action', text_actions[i]) for i, info in enumerate(infos)],
++                dtype=object,
++            )
++            batch.non_tensor_batch['raw_observations'] = np.array(
++                [info.get('raw_observation', '') for info in infos], dtype=object
++            )
++            batch.non_tensor_batch['environment_dones'] = np.array(
++                [bool(info.get('environment_done', dones[i])) for i, info in enumerate(infos)],
++                dtype=bool,
++            )
++            batch.non_tensor_batch['environment_won'] = np.array(
++                [float(info.get('won', 0.0)) for info in infos], dtype=np.float32
++            )
++            batch.non_tensor_batch['goal_condition_success_rate'] = np.array(
++                [float(info.get('goal_condition_success_rate', 0.0)) for info in infos],
++                dtype=np.float32,
++            )
++            batch.non_tensor_batch['task_description'] = np.array(
++                [info.get('task_description', '') for info in infos], dtype=object
++            )
+ 
+             if 'tool_calling' in infos[0]:
+                 tool_callings[active_masks] += np.array([info['tool_calling'] for info in infos], dtype=np.float32)[active_masks]
+@@ -576,4 +601,4 @@ class TrajectoryCollector:
+         # np.set_printoptions(threshold=np.inf)
+         # print(gen_batch_output)
+         # 0/0
+-        return gen_batch_output
+\ No newline at end of file
++        return gen_batch_output
